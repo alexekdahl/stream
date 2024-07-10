@@ -2,12 +2,10 @@ package main
 
 import (
 	"crypto/tls"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 
 	"github.com/alexekdahl/stream/imageproc"
 	"github.com/alexekdahl/stream/stream"
@@ -15,7 +13,8 @@ import (
 
 const (
 	// streamURL   = "http://192.168.0.6/axis-cgi/mjpg/video.cgi"
-	streamURL   = "http://172.29.166.189/axis-cgi/mjpg/video.cgi?camera=2"
+	streamURL = "http://172.29.166.189/axis-cgi/mjpg/video.cgi?camera=2"
+	// streamURL   = "http://172.29.166.199/axis-cgi/mjpg/video.cgi?camera=2"
 	username    = "root"
 	password    = "pass"
 	clientNonce = "abcdef"
@@ -24,10 +23,15 @@ const (
 const (
 	MoveCursorOrigin   = "\x1b[1;1H"
 	EraseEntireDisplay = "\x1b[2J"
-	HideCursor         = "\x1b[?25l"
+	hideCursor         = "\x1b[?25l"
+	showCursor         = "\x1b[?25h\x1b[2J"
 )
 
+var showTerminalcursor = []byte{0x1b, 0x5b, 0x3f, 0x32, 0x35, 0, 0x68}
+
 func main() {
+	go handleInterrupt()
+
 	config := stream.Config{
 		URL:         streamURL,
 		Username:    username,
@@ -41,28 +45,24 @@ func main() {
 		},
 	}
 
-	resp, err := stream.FetchStream(client, config)
+	streamer, err := stream.FetchVideoStream(client, config)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer streamer.Close()
 
-	contentType := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "multipart/x-mixed-replace") {
-		log.Fatal(fmt.Errorf("unexpected content type: %s", contentType))
-	}
+	os.Stdout.Write([]byte(hideCursor))
+	os.Stdout.Write([]byte(EraseEntireDisplay))
 
-	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
-		<-c
-		os.Stdout.Write([]byte("\x1b[?25h\x1b[2J"))
-		os.Exit(0)
-	}()
-
-	fmt.Print(HideCursor)
-	fmt.Print(EraseEntireDisplay)
-	if err := imageproc.ProcessStream(resp.Body, contentType); err != nil {
+	if err := imageproc.ProcessVideoStream(streamer); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func handleInterrupt() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	<-c
+	os.Stdout.Write(showTerminalcursor)
+	os.Exit(0)
 }

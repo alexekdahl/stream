@@ -1,30 +1,39 @@
 package imageproc
 
 import (
-	"bytes"
 	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"io"
 	"log"
-	"mime/multipart"
 	"os"
-	"strings"
+	"sync"
 )
 
-const grayChars = " .:coP#%O?@"
+const grayChars = " .:;coPBO?#%@"
 
-func ProcessStream(stream io.Reader, contentType string) error {
-	boundary := extractBoundary(contentType)
-	reader := multipart.NewReader(stream, boundary)
+var (
+	topLeft   = []byte("\x1b[H")
+	resetCode = []byte("\x1b[0m")
+)
 
-	topLeft := []byte("\033[H")
-	prevFrame := []byte{}
+type streamer interface {
+	NextPart() (io.Reader, error)
+}
+
+// ProcessVideoStream reads and processes the image stream from a multipart reader.
+func ProcessVideoStream(stream streamer) error {
+	var bufferPool sync.Pool
+	bufferPool.New = func() interface{} {
+		buf := make([]byte, 0, 4096) // Pre-allocated buffer size
+		return &buf
+	}
+
 	for {
-		part, err := reader.NextPart()
+		part, err := stream.NextPart()
 		if err != nil {
-			return fmt.Errorf("error reading next part: %v", err)
+			return fmt.Errorf("error reading next part: %w", err)
 		}
 
 		img, err := jpeg.Decode(part)
@@ -32,91 +41,60 @@ func ProcessStream(stream io.Reader, contentType string) error {
 			log.Printf("error decoding image: %v", err)
 			continue
 		}
-		frame := convertToASCII(img)
-		if compareSlices(prevFrame, frame) {
-			continue
-		}
-		os.Stdout.Write(topLeft)
-		os.Stdout.Write(frame)
-		prevFrame = frame
+
+		processAndWriteFrame(img, &bufferPool)
 	}
 }
 
-func extractBoundary(contentType string) string {
-	parts := strings.Split(contentType, "boundary=")
-	if len(parts) != 2 {
-		log.Fatal("invalid content type")
+func processAndWriteFrame(img image.Image, bufferPool *sync.Pool) {
+	width := img.Bounds().Dx()
+	height := img.Bounds().Dy()
+	aspectRatio := float64(width) / float64(height)
+	newWidth := 200
+	newHeight := int(float64(newWidth) / aspectRatio / 2)
+
+	scaleX := float64(width) / float64(newWidth)
+	scaleY := float64(height) / float64(newHeight)
+
+	// Precalculate buffer size: (width * height) + newHeight for newlines
+	bufferSize := (newWidth * newHeight) + newHeight
+	buf := bufferPool.Get().(*[]byte)
+	if cap(*buf) < bufferSize {
+		*buf = make([]byte, 0, bufferSize)
 	}
-	return parts[1]
-}
+	defer bufferPool.Put(buf)
 
-func scaleAndConvertToASCII(img image.Image, targetWidth, targetHeight int) []byte {
-	bounds := img.Bounds()
-	originalWidth := bounds.Dx()
-	originalHeight := bounds.Dy()
+	*buf = (*buf)[:0] // Reset buffer
+	os.Stdout.Write(topLeft)
 
-	scaleX := float64(originalWidth) / float64(targetWidth)
-	scaleY := float64(originalHeight) / float64(targetHeight)
-
-	buffer := bytes.Buffer{}
-	for y := 0; y < targetHeight; y++ {
-		for x := 0; x < targetWidth; x++ {
+	for y := 0; y < newHeight; y++ {
+		for x := 0; x < newWidth; x++ {
 			srcX := int(float64(x) * scaleX)
 			srcY := int(float64(y) * scaleY)
 			pixel := img.At(srcX, srcY)
 			rgba := color.RGBAModel.Convert(pixel).(color.RGBA)
 			grayScale := color.GrayModel.Convert(pixel).(color.Gray).Y
 			scale := int(grayScale) * len(grayChars) / 255
-			if scale > 10 {
-				scale = 10
+			if scale >= len(grayChars) {
+				scale = len(grayChars) - 1
 			}
 
-			writeInColor(&buffer, rgba, rune(grayChars[scale]))
+			char := grayChars[scale]
+			writeInColor(buf, rgba, char)
 		}
-		buffer.WriteString("\n")
+		*buf = append(*buf, '\n')
 	}
 
-	return buffer.Bytes()
+	os.Stdout.Write(*buf)
 }
 
-// func to compare two byte slices
-func compareSlices(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
-}
-
-// Convert RGBA to colored ASCII character and write to buffer
-func writeInColor(buffer *bytes.Buffer, rgba color.RGBA, char rune) {
+func writeInColor(buffer *[]byte, rgba color.RGBA, char byte) {
 	r, g, b, _ := rgba.RGBA()
 
 	// ANSI escape sequence for the color
 	colorCode := fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r>>8, g>>8, b>>8)
-	resetCode := "\x1b[0m"
 
-	// escape sequence followed by the character and the reset code
-	buffer.WriteString(colorCode)
-	buffer.WriteRune(char)
-	buffer.WriteString(resetCode)
-}
-
-func convertToASCII(img image.Image) []byte {
-	width := img.Bounds().Dx()
-	height := img.Bounds().Dy()
-
-	aspectRatio := float64(width) / float64(height)
-	newWidth := 200
-	newHeight := int(float64(newWidth) / aspectRatio / 2)
-
-	frame := scaleAndConvertToASCII(img, newWidth, newHeight)
-
-	return frame
+	*buffer = append(*buffer, colorCode...)
+	*buffer = append(*buffer, char)
+	*buffer = append(*buffer, resetCode...)
 }

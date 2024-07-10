@@ -1,7 +1,11 @@
 package stream
 
 import (
+	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
+	"strings"
 
 	"github.com/alexekdahl/stream/auth"
 )
@@ -13,7 +17,36 @@ type Config struct {
 	ClientNonce string
 }
 
-func FetchStream(client *http.Client, config Config) (*http.Response, error) {
+type Streamer struct {
+	reader *multipart.Reader
+	stream io.ReadCloser
+}
+
+func (s *Streamer) NextPart() (io.Reader, error) {
+	part, err := s.reader.NextPart()
+	if err == io.EOF {
+		return nil, fmt.Errorf("no more parts")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return part, nil
+}
+
+func newStreamer(stream io.ReadCloser, boundary string) *Streamer {
+	return &Streamer{
+		reader: multipart.NewReader(stream, boundary),
+		stream: stream,
+	}
+}
+
+func (s *Streamer) Close() error {
+	return s.stream.Close()
+}
+
+func FetchVideoStream(client *http.Client, config Config) (*Streamer, error) {
 	req, err := http.NewRequest("GET", config.URL, nil)
 	if err != nil {
 		return nil, err
@@ -34,14 +67,28 @@ func FetchStream(client *http.Client, config Config) (*http.Response, error) {
 			config.ClientNonce,
 		)
 		if err != nil {
+			resp.Body.Close()
 			return nil, err
 		}
 
 		resp, err = client.Do(authedReq)
 		if err != nil {
+			resp.Body.Close()
 			return nil, err
 		}
 	}
 
-	return resp, nil
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "multipart/x-mixed-replace") {
+		resp.Body.Close()
+		return nil, fmt.Errorf("unexpected content type: %s", contentType)
+	}
+
+	parts := strings.Split(contentType, "boundary=")
+	if len(parts) != 2 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("invalid content type")
+	}
+
+	return newStreamer(resp.Body, parts[1]), nil
 }
